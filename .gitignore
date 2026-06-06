@@ -1,0 +1,17 @@
+# generated reports
+report.html
+report.json
+*.report.html
+*.report.json
+
+# local HTTP cache
+.citecheck_cache.json
+
+# python
+__pycache__/
+*.pyc
+
+# editor / OS / misc
+.claude/
+.DS_Store
+*.zip
