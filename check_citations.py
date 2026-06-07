@@ -432,8 +432,11 @@ class Net:
 def extract_arxiv_id(entry):
     f = entry["fields"]
     blob = " ".join([f.get("journal", ""), f.get("eprint", ""), f.get("url", ""),
-                     f.get("note", ""), f.get("howpublished", "")])
-    m = re.search(r"arxiv[:/ ]*?(\d{4}\.\d{4,5})", blob, re.I)
+                     f.get("note", ""), f.get("howpublished", ""), f.get("doi", "")])
+    # arXiv's own DOI namespace embeds the id: 10.48550/arXiv.2501.15383
+    m = re.search(r"10\.48550/arxiv\.(\d{4}\.\d{4,5})", blob, re.I)
+    if not m:
+        m = re.search(r"arxiv[:/ ]*?(\d{4}\.\d{4,5})", blob, re.I)
     if not m:
         m = re.search(r"arxiv\.org/abs/(\d{4}\.\d{4,5})", blob, re.I)
     if m:
@@ -448,11 +451,17 @@ def extract_arxiv_id(entry):
 def extract_doi(entry):
     f = entry["fields"]
     doi = f.get("doi", "").strip()
-    if doi:
-        doi = re.sub(r"^https?://(dx\.)?doi\.org/", "", doi, flags=re.I)
-        return doi
-    m = re.search(r"doi\.org/(10\.\S+)", f.get("url", ""), re.I)
-    return m.group(1) if m else None
+    if not doi:
+        m = re.search(r"doi\.org/(10\.\S+)", f.get("url", ""), re.I)
+        doi = m.group(1) if m else ""
+    doi = re.sub(r"^https?://(dx\.)?doi\.org/", "", doi, flags=re.I).strip()
+    if not doi:
+        return None
+    # arXiv DOIs (10.48550/arXiv.*) are NOT registered with Crossref — they are
+    # handled via the arXiv id instead, so don't treat them as Crossref DOIs.
+    if re.match(r"10\.48550/arxiv\.", doi, re.I):
+        return None
+    return doi
 
 
 def extract_openreview_id(entry):
@@ -610,6 +619,20 @@ def _crossref_item_to_record(msg):
     return {"source": "Crossref", "found": True, "title": title, "authors": authors,
             "raw_authors": raw, "year": year, "venue": venue,
             "doi": msg.get("DOI"), "url": msg.get("URL"), "note": ""}
+
+
+def doi_resolves(net, doi):
+    """Check whether a DOI resolves at doi.org. Returns True (resolves),
+    False (404 — does not exist), or None (could not reach / inconclusive).
+    Used as a second opinion before declaring a DOI fabricated, since valid
+    DataCite DOIs (Zenodo, ACL, datasets) are not in Crossref."""
+    url = "https://doi.org/" + urllib.parse.quote(doi)
+    status, _ = net.get(url, ua=BROWSER_UA, retries=3)
+    if status in (404, 410):
+        return False
+    if status and 200 <= status < 400 or status in (401, 403):
+        return True
+    return None
 
 
 def crossref_lookup(net, doi):
@@ -937,7 +960,19 @@ def verify_entry(net, entry):
             add(INFO, f"could not verify DOI {doi} ({rec.get('note','')}) "
                       f"— network/rate-limit, not checked")
         else:
-            add(FAIL, f"DOI {doi} does NOT resolve on Crossref — invalid/incorrect DOI")
+            # Crossref doesn't have it — but many valid DOIs (DataCite: Zenodo,
+            # ACL Anthology, datasets…) aren't in Crossref. Confirm via doi.org
+            # before calling it fabricated: only a DOI that doesn't resolve
+            # anywhere is a real problem.
+            dr = doi_resolves(net, doi)
+            if dr is True:
+                add(INFO, f"DOI {doi} resolves (via doi.org) but is not in Crossref "
+                          f"— metadata not cross-checked")
+            elif dr is None:
+                add(INFO, f"could not verify DOI {doi} (doi.org unreachable) — not checked")
+            else:
+                add(FAIL, f"DOI {doi} does NOT resolve (Crossref + doi.org) "
+                          f"— invalid/incorrect DOI")
     if openreview_id:
         rec = openreview_lookup(net, openreview_id)
         rec["queried"] = openreview_id
