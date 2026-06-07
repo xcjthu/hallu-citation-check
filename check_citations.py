@@ -274,6 +274,9 @@ def parse_bib_authors(raw):
         p = p.strip().strip(",")
         if not p:
             continue
+        if p.lower() in ("others", "et al", "et al."):
+            out.append({"display": "et al.", "surname": "", "etal": True})
+            continue
         if "," in p:
             last, _, first = p.partition(",")
             last = last.strip()
@@ -318,6 +321,17 @@ def looks_corporate(bib_author_raw):
 # 3. HTTP layer with cache + retry
 # ============================================================================
 class Net:
+    # Minimum seconds between consecutive requests to the SAME host. Rate limits
+    # are per-host, so spacing same-host calls proactively avoids 429s entirely
+    # (different hosts proceed in parallel-ish without waiting on each other).
+    HOST_MIN_INTERVAL = {
+        "export.arxiv.org": 3.1,   # arXiv API asks for ~1 req / 3s
+        "arxiv.org": 1.0,
+        "dblp.org": 1.6,
+        "api.crossref.org": 0.5,
+        "api2.openreview.net": 0.5,
+    }
+
     def __init__(self, delay=0.8, use_cache=True, timeout=30, verbose=False):
         self.delay = delay
         self.timeout = timeout
@@ -325,6 +339,8 @@ class Net:
         self.use_cache = use_cache
         self.cache = {}
         self._last = 0.0
+        self._host_last = {}     # host -> last request time
+        self._host_penalty = {}  # host -> extra delay added after a 429
         if use_cache and os.path.exists(CACHE_PATH):
             try:
                 with open(CACHE_PATH, encoding="utf-8") as f:
@@ -340,23 +356,36 @@ class Net:
             except Exception:
                 pass
 
-    def _throttle(self):
-        wait = self.delay - (time.time() - self._last)
+    def _throttle(self, host=None):
+        now = time.time()
+        # global politeness floor
+        wait = self.delay - (now - self._last)
+        # per-host minimum interval (+ any adaptive penalty from prior 429s)
+        if host:
+            need = self.HOST_MIN_INTERVAL.get(host, 0) + self._host_penalty.get(host, 0)
+            wait = max(wait, need - (now - self._host_last.get(host, 0.0)))
         if wait > 0:
             time.sleep(wait)
-        self._last = time.time()
+        t = time.time()
+        self._last = t
+        if host:
+            self._host_last[host] = t
 
     def get(self, url, accept=None, retries=3, ua=None):
         ck = (accept or "") + "|" + url
         if self.use_cache and ck in self.cache:
             c = self.cache[ck]
             return c["status"], c["body"]
+        try:
+            host = urllib.parse.urlparse(url).hostname or ""
+        except Exception:
+            host = ""
         headers = {"User-Agent": ua or UA}
         if accept:
             headers["Accept"] = accept
         result = (None, "")
         for attempt in range(retries):
-            self._throttle()
+            self._throttle(host)
             try:
                 req = urllib.request.Request(url, headers=headers)
                 with urllib.request.urlopen(req, timeout=self.timeout) as r:
@@ -371,8 +400,11 @@ class Net:
                     body = e.read().decode("utf-8", "replace")
                 except Exception:
                     pass
+                if status == 429:
+                    # back off this host for the rest of the run, then retry
+                    self._host_penalty[host] = min(self._host_penalty.get(host, 0) + 2.0, 10.0)
                 if status in (429, 500, 502, 503, 504) and attempt < retries - 1:
-                    time.sleep(1.5 * (attempt + 1))
+                    time.sleep(2.0 * (attempt + 1))
                     continue
                 result = (status, body)
                 break
@@ -384,7 +416,10 @@ class Net:
                 break
         if self.verbose:
             sys.stderr.write(C.dim(f"    GET {result[0]} {url}\n"))
-        if self.use_cache and result[0] is not None:
+        # Only cache definitive answers. Never cache transient failures
+        # (rate limits / 5xx / connection errors) — caching a 429 would
+        # poison the entry and could mislabel a real paper as fabricated.
+        if self.use_cache and result[0] not in (None, 429, 500, 502, 503, 504):
             self.cache[ck] = {"status": result[0], "body": result[1]}
         return result
 
@@ -427,24 +462,14 @@ def extract_openreview_id(entry):
     return m.group(1) if m else None
 
 
-def arxiv_lookup(net, arxiv_id):
-    arxiv_id = arxiv_id.split("v")[0]
-    url = "https://export.arxiv.org/api/query?id_list=" + urllib.parse.quote(arxiv_id)
-    status, body = net.get(url)
-    if status != 200 or not body:
-        return {"source": "arXiv", "found": False, "note": f"HTTP {status}"}
-    ns = {"a": "http://www.w3.org/2005/Atom"}
-    try:
-        root = ET.fromstring(body)
-    except ET.ParseError:
-        return {"source": "arXiv", "found": False, "note": "parse error"}
-    entries = root.findall("a:entry", ns)
-    if not entries:
-        return {"source": "arXiv", "found": False, "note": "id not found"}
-    e = entries[0]
+_ARXIV_NS = {"a": "http://www.w3.org/2005/Atom"}
+
+
+def _arxiv_entry_to_record(e):
+    ns = _ARXIV_NS
     title = (e.findtext("a:title", "", ns) or "").strip()
-    if title.lower().startswith("error"):
-        return {"source": "arXiv", "found": False, "note": "id not found"}
+    if not title or title.lower().startswith("error"):
+        return None
     authors = [surname_of_full((a.findtext("a:name", "", ns) or "")) for a in e.findall("a:author", ns)]
     raw_authors = [(a.findtext("a:name", "", ns) or "").strip() for a in e.findall("a:author", ns)]
     published = e.findtext("a:published", "", ns) or ""
@@ -455,17 +480,119 @@ def arxiv_lookup(net, arxiv_id):
             "year": year, "venue": "arXiv", "doi": None, "url": idu, "note": ""}
 
 
-def crossref_lookup(net, doi):
-    url = "https://api.crossref.org/works/" + urllib.parse.quote(doi)
-    status, body = net.get(url, accept="application/json")
-    if status == 404:
-        return {"source": "Crossref", "found": False, "note": "DOI not registered"}
+def _norm_arxiv_id(arxiv_id):
+    return re.sub(r"v\d+$", "", arxiv_id.strip())
+
+
+def arxiv_batch(net, ids):
+    """Pre-fetch many arXiv ids at once. Returns {id: record-or-None}:
+    a record if found, None if the API definitively had no such id. Ids that
+    could not be resolved (HTTP error / rate limit) are simply absent from the
+    dict, so the caller can retry them individually instead of mislabelling
+    them as fabricated."""
+    out = {}
+    ids = [_norm_arxiv_id(i) for i in ids]
+    for i in range(0, len(ids), 40):
+        chunk = ids[i:i + 40]
+        url = ("https://export.arxiv.org/api/query?max_results=100&id_list="
+               + ",".join(urllib.parse.quote(c) for c in chunk))
+        status, body = net.get(url, retries=2)
+        if status != 200 or not body:
+            continue                       # leave chunk unresolved -> retry later
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError:
+            continue
+        by_id = {}
+        for e in root.findall("a:entry", _ARXIV_NS):
+            idu = (e.findtext("a:id", "", _ARXIV_NS) or "")
+            m = re.search(r"abs/(\d{4}\.\d{4,5})", idu)
+            if m:
+                by_id[m.group(1)] = _arxiv_entry_to_record(e)
+        for c in chunk:
+            out[c] = by_id.get(c)          # record or None (definitively absent)
+    return out
+
+
+def _parse_meta_tags(body):
+    """Extract {name: [values]} from HTML <meta name=.. content=..> tags."""
+    out = {}
+    for tag in re.findall(r"<meta\b[^>]*>", body, re.I):
+        nm = re.search(r'\bname\s*=\s*"([^"]*)"', tag, re.I)
+        ct = re.search(r'\bcontent\s*=\s*"([^"]*)"', tag, re.I)
+        if nm and ct:
+            out.setdefault(nm.group(1).lower(), []).append(html.unescape(ct.group(1)))
+    return out
+
+
+def arxiv_abs_lookup(net, arxiv_id):
+    """Fallback verification via the public abstract page https://arxiv.org/abs/<id>.
+    Served by different infrastructure than the API, so it usually answers even
+    when export.arxiv.org is rate-limiting. Reads the reliable citation_* metas."""
+    url = "https://arxiv.org/abs/" + urllib.parse.quote(arxiv_id)
+    status, body = net.get(url, ua=BROWSER_UA, retries=4)
+    if status in (404, 410):
+        return {"source": "arXiv", "found": False, "error": False, "note": "abs page 404"}
     if status != 200 or not body:
-        return {"source": "Crossref", "found": False, "note": f"HTTP {status}"}
-    try:
-        msg = json.loads(body)["message"]
-    except Exception:
-        return {"source": "Crossref", "found": False, "note": "parse error"}
+        return {"source": "arXiv", "found": False, "error": True, "note": f"abs HTTP {status}"}
+    meta = _parse_meta_tags(body)
+    titles = meta.get("citation_title")
+    if not titles:
+        return {"source": "arXiv", "found": False, "error": True, "note": "abs page unparsed"}
+    raw_authors, surnames = [], []
+    for a in meta.get("citation_author", []):
+        a = a.strip()
+        if "," in a:               # "Last, First"
+            last, _, first = a.partition(",")
+            raw_authors.append((first.strip() + " " + last.strip()).strip())
+            sur = last.strip()
+        else:
+            raw_authors.append(a)
+            sur = a.split()[-1] if a.split() else a
+        sn = re.sub(r"[^a-z0-9\- ]", "", asciifold(sur).lower())
+        if sn:
+            surnames.append(sn)
+    dates = meta.get("citation_date") or meta.get("citation_online_date") or []
+    ym = re.search(r"(19|20)\d\d", dates[0]) if dates else None
+    return {"source": "arXiv", "found": True, "title": titles[0].strip(),
+            "authors": surnames, "raw_authors": raw_authors,
+            "year": ym.group(0) if ym else None, "venue": "arXiv", "doi": None,
+            "url": "https://arxiv.org/abs/" + arxiv_id, "note": "via abs page"}
+
+
+def arxiv_lookup(net, arxiv_id):
+    arxiv_id = _norm_arxiv_id(arxiv_id)
+    pf = getattr(net, "arxiv_prefetch", None)
+    if pf is not None and arxiv_id in pf:
+        rec = pf[arxiv_id]
+        if rec:
+            return rec
+        # batch said "absent" — double-check via the abs page before trusting it
+        abs_rec = arxiv_abs_lookup(net, arxiv_id)
+        if abs_rec["found"] or not abs_rec.get("error"):
+            return abs_rec
+        return {"source": "arXiv", "found": False, "error": False, "note": "id not found"}
+
+    url = "https://export.arxiv.org/api/query?id_list=" + urllib.parse.quote(arxiv_id)
+    status, body = net.get(url, retries=4)
+    if status == 200 and body:
+        try:
+            entries = ET.fromstring(body).findall("a:entry", _ARXIV_NS)
+            rec = _arxiv_entry_to_record(entries[0]) if entries else None
+            if rec:
+                return rec
+            # API answered cleanly with no entry -> confirm absence via abs page
+            abs_rec = arxiv_abs_lookup(net, arxiv_id)
+            if abs_rec["found"] or not abs_rec.get("error"):
+                return abs_rec
+            return {"source": "arXiv", "found": False, "error": False, "note": "id not found"}
+        except ET.ParseError:
+            pass
+    # API errored (rate limit / 5xx / timeout) -> fall back to the abs page
+    return arxiv_abs_lookup(net, arxiv_id)
+
+
+def _crossref_item_to_record(msg):
     title = (msg.get("title") or [""])[0]
     authors, raw = [], []
     for a in msg.get("author", []) or []:
@@ -485,13 +612,61 @@ def crossref_lookup(net, doi):
             "doi": msg.get("DOI"), "url": msg.get("URL"), "note": ""}
 
 
+def crossref_lookup(net, doi):
+    url = "https://api.crossref.org/works/" + urllib.parse.quote(doi)
+    status, body = net.get(url, accept="application/json")
+    if status == 404:
+        return {"source": "Crossref", "found": False, "error": False, "note": "DOI not registered"}
+    if status != 200 or not body:
+        return {"source": "Crossref", "found": False, "error": True, "note": f"HTTP {status}"}
+    try:
+        msg = json.loads(body)["message"]
+    except Exception:
+        return {"source": "Crossref", "found": False, "error": True, "note": "parse error"}
+    return _crossref_item_to_record(msg)
+
+
+def crossref_search(net, title, first_author=None):
+    """Title search on Crossref (reliable 'polite pool', generous rate limit).
+    Primary fallback for papers with no arXiv/DOI/OpenReview id. The bib's first
+    author surname is added to the query to disambiguate common/short titles
+    (e.g. many papers contain 'Denoising Diffusion Probabilistic Models')."""
+    q = norm_title(title)
+    if not q:
+        return {"source": "Crossref", "found": False, "error": False, "note": "empty title"}
+    url = ("https://api.crossref.org/works?rows=10&select=title,author,issued,"
+           "container-title,DOI,URL&query.bibliographic=" + urllib.parse.quote(q))
+    if first_author:
+        url += "&query.author=" + urllib.parse.quote(first_author)
+    status, body = net.get(url, accept="application/json")
+    if status != 200 or not body:
+        return {"source": "Crossref", "found": False, "error": True, "note": f"HTTP {status}"}
+    try:
+        items = json.loads(body)["message"]["items"]
+    except Exception:
+        return {"source": "Crossref", "found": False, "error": True, "note": "parse error"}
+    best, best_r = None, 0.0
+    for it in items:
+        r = title_ratio(title, (it.get("title") or [""])[0])
+        if r > best_r:
+            best_r, best = r, it
+    if not best or best_r < 0.90:    # title-only match needs a high bar
+        return {"source": "Crossref", "found": False, "error": False,
+                "note": "no close Crossref title match", "best_ratio": round(best_r, 2)}
+    rec = _crossref_item_to_record(best)
+    rec["match_ratio"] = round(best_r, 2)
+    return rec
+
+
 def openreview_lookup(net, oid):
     """Look up an OpenReview submission by forum id (api2). Authoritative for the
     real publication venue + year (e.g. 'ICLR 2026 Oral')."""
     base = "https://api2.openreview.net/notes?"
+    errored = False
     for q in ("id=" + urllib.parse.quote(oid), "forum=" + urllib.parse.quote(oid)):
         status, body = net.get(base + q, accept="application/json")
         if status != 200 or not body:
+            errored = errored or (status != 200)
             continue
         try:
             notes = json.loads(body).get("notes", [])
@@ -533,7 +708,8 @@ def openreview_lookup(net, oid):
                 "authors": [a for a in authors if a], "raw_authors": raw_authors,
                 "year": year, "venue": venue, "doi": None,
                 "url": "https://openreview.net/forum?id=" + oid, "note": ""}
-    return {"source": "OpenReview", "found": False, "note": "forum id not found"}
+    return {"source": "OpenReview", "found": False, "error": errored,
+            "note": ("could not reach OpenReview" if errored else "forum id not found")}
 
 
 def _as_list(x):
@@ -542,21 +718,25 @@ def _as_list(x):
     return x if isinstance(x, list) else [x]
 
 
-def dblp_search(net, title):
+def dblp_search(net, title, first_author=None):
     q = norm_title(title)
     if not q:
-        return {"source": "DBLP", "found": False, "note": "empty title"}
-    url = ("https://dblp.org/search/publ/api?format=json&h=15&q="
+        return {"source": "DBLP", "found": False, "error": False, "note": "empty title"}
+    # Append the first-author surname to disambiguate common/short titles that
+    # otherwise return hundreds of derivative papers ahead of the original.
+    if first_author:
+        q = q + " " + first_author
+    url = ("https://dblp.org/search/publ/api?format=json&h=30&q="
            + urllib.parse.quote(q))
     status, body = net.get(url, accept="application/json")
     if status != 200 or not body:
-        return {"source": "DBLP", "found": False, "note": f"HTTP {status}"}
+        return {"source": "DBLP", "found": False, "error": True, "note": f"HTTP {status}"}
     try:
         hits = json.loads(body)["result"]["hits"]
     except Exception:
-        return {"source": "DBLP", "found": False, "note": "parse error"}
+        return {"source": "DBLP", "found": False, "error": True, "note": "parse error"}
     if hits.get("@total", "0") == "0" or "hit" not in hits:
-        return {"source": "DBLP", "found": False, "note": "no DBLP hit"}
+        return {"source": "DBLP", "found": False, "error": False, "note": "no DBLP hit"}
     # Score every hit by title similarity. When the same paper appears as both a
     # preprint ("CoRR") and a published version, prefer the published one so the
     # reported year/venue is the proceedings year, not the preprint year.
@@ -567,8 +747,8 @@ def dblp_search(net, title):
     scored.sort(key=lambda x: x[0], reverse=True)
     best_r = scored[0][0] if scored else 0.0
     if not scored or best_r < 0.82:
-        return {"source": "DBLP", "found": False, "note": "no close DBLP title match",
-                "best_ratio": round(best_r, 2)}
+        return {"source": "DBLP", "found": False, "error": False,
+                "note": "no close DBLP title match", "best_ratio": round(best_r, 2)}
     # among near-ties (within 0.03 of the top), prefer a non-CoRR venue
     near = [info for r, info in scored if best_r - r <= 0.03]
     best = next((i for i in near if (i.get("venue") or "").upper() != "CORR"), near[0])
@@ -619,7 +799,11 @@ def cmp_authors(bib_raw, rec):
     where `matched` flags whether that name appears on the other side."""
     if looks_corporate(bib_raw):
         return INFO, "group/organization author — not individually verifiable", None
-    bib = parse_bib_authors(bib_raw)
+    parsed = parse_bib_authors(bib_raw)
+    # an explicit "and others" / "et al." marks the list as deliberately
+    # truncated, so the source legitimately having MORE authors is expected.
+    truncated = any(b.get("etal") for b in parsed)
+    bib = [b for b in parsed if not b.get("etal")]
     src_surn = rec.get("authors", [])
     src_raw = rec.get("raw_authors") or []
     if not bib:
@@ -665,9 +849,16 @@ def cmp_authors(bib_raw, rec):
         "bib": [{"display": b["display"], "matched": b["matched"]} for b in bib],
         "src": [{"display": delatex(s), "matched": in_bib(s)} for s in src_raw],
     }
-    detail = (f"bib {len(bib)} authors vs {rec['source']} {len(src_raw)}; "
-              f"overlap {len(matched)}/{len(bib)}")
+    detail = (f"bib {len(bib)}{'+' if truncated else ''} authors vs "
+              f"{rec['source']} {len(src_raw)}; overlap {len(matched)}/{len(bib)}")
     miss_str = f"; not in {rec['source']}: {', '.join(missing)}" if missing else ""
+    # When the bib list is explicitly truncated ("and others"), only the listed
+    # names need to match; the source having more authors is expected.
+    if truncated:
+        if overlap >= 0.99:
+            return OK, detail, None
+        if first_ok and overlap >= 0.85:
+            return MINOR, detail + miss_str, diff
     if overlap >= 0.99 and len(bib) == len(src_raw):
         return OK, detail, None
     if first_ok and overlap >= 0.85:
@@ -720,41 +911,69 @@ def verify_entry(net, entry):
     recs = {}            # source name -> normalized record (found ones only)
 
     # --- identifier-authoritative checks -----------------------------------
+    # A lookup can come back three ways: found / definitively-absent / error.
+    # Only a *definitive* absence (HTTP 200 with no such record) means the
+    # identifier is fabricated. An error (rate limit, timeout) must NOT be
+    # reported as a hallucination — it just means "could not verify".
     if arxiv_id:
         rec = arxiv_lookup(net, arxiv_id)
         rec["queried"] = arxiv_id
         evidence.append(rec)
-        if not rec["found"]:
-            add(FAIL, f"arXiv id {arxiv_id} does NOT exist on arXiv ({rec.get('note','')}) "
-                      f"— fabricated identifier")
-        else:
+        if rec["found"]:
             recs["arXiv"] = rec
+        elif rec.get("error"):
+            add(INFO, f"could not verify arXiv id {arxiv_id} ({rec.get('note','')}) "
+                      f"— network/rate-limit, not checked")
+        else:
+            add(FAIL, f"arXiv id {arxiv_id} does NOT exist on arXiv "
+                      f"— fabricated/incorrect identifier")
     if doi:
         rec = crossref_lookup(net, doi)
         rec["queried"] = doi
         evidence.append(rec)
-        if not rec["found"]:
-            add(FAIL, f"DOI {doi} does NOT resolve on Crossref ({rec.get('note','')})")
-        else:
+        if rec["found"]:
             recs["Crossref"] = rec
+        elif rec.get("error"):
+            add(INFO, f"could not verify DOI {doi} ({rec.get('note','')}) "
+                      f"— network/rate-limit, not checked")
+        else:
+            add(FAIL, f"DOI {doi} does NOT resolve on Crossref — invalid/incorrect DOI")
     if openreview_id:
         rec = openreview_lookup(net, openreview_id)
         rec["queried"] = openreview_id
         evidence.append(rec)
         if rec["found"]:
             recs["OpenReview"] = rec
+        elif rec.get("error"):
+            add(INFO, f"could not reach OpenReview for id {openreview_id} — not checked")
         else:
-            add(INFO, f"OpenReview id {openreview_id} could not be fetched "
-                      f"({rec.get('note','')}) — may be withdrawn/private")
+            add(INFO, f"OpenReview id {openreview_id} not found — may be withdrawn/private")
 
-    # --- DBLP cross-check (primary source for real publications) -----------
-    # Only meaningful for paper-type entries; blogs/repos/model cards (@misc,
-    # @software) are not in DBLP, and a loose fuzzy hit there causes false alarms.
-    if bib_title and entry["type"] in PAPER_TYPES:
-        dblp = dblp_search(net, bib_title)
-        evidence.append(dblp)
-        if dblp.get("found"):
-            recs["DBLP"] = dblp
+    # --- title-search fallback for entries with no usable identifier -------
+    # Many bib entries (classic NeurIPS/Biometrika papers etc.) carry no arXiv
+    # id / DOI / OpenReview id. For these we verify by TITLE. Crossref's title
+    # search is the primary fallback (reliable "polite pool", generous limits);
+    # DBLP is consulted only if Crossref comes up empty, since DBLP rate-limits
+    # aggressively and is too slow to lean on at scale.
+    have_record = bool(recs.get("arXiv") or recs.get("Crossref") or recs.get("OpenReview"))
+    search_errored = False
+    if bib_title and entry["type"] in PAPER_TYPES and not have_record:
+        # first-author surname disambiguates common/short titles
+        _ba = [b for b in parse_bib_authors(bib_authors) if not b.get("etal")]
+        first_author = _ba[0]["surname"] if _ba else None
+        cr = crossref_search(net, bib_title, first_author=first_author)
+        evidence.append(cr)
+        if cr.get("found"):
+            recs["Crossref"] = cr
+        else:
+            search_errored = search_errored or cr.get("error", False)
+            dblp = dblp_search(net, bib_title, first_author=first_author)
+            evidence.append(dblp)
+            if dblp.get("found"):
+                recs["DBLP"] = dblp
+            else:
+                search_errored = search_errored or dblp.get("error", False)
+    dblp_errored = search_errored
 
     # --- pick references ---------------------------------------------------
     # Title/authors: prefer arXiv (canonical, full author list); then the
@@ -797,6 +1016,12 @@ def verify_entry(net, entry):
         add(*venue_note)
 
     # --- unverifiable entries (misc/software/blogs) ------------------------
+    # Did any consulted source fail transiently (rate limit / network)? If so,
+    # an absence of confirmation must NOT be reported as a problem — we simply
+    # could not verify and the user should re-run.
+    any_error = dblp_errored or any(
+        r.get("error") for r in evidence if isinstance(r, dict) and r.get("source") in
+        ("arXiv", "Crossref", "OpenReview", "DBLP"))
     confirmed = bool(title_ref and title_status in (OK, MINOR))
     if not confirmed and not any(s == FAIL for s, _ in issues):
         url_field = f.get("url") or f.get("howpublished") or f.get("note") or ""
@@ -815,8 +1040,11 @@ def verify_entry(net, entry):
                           f"verify manually): {uc.get('url')}")
             else:
                 add(WARN, f"no academic record; URL returned HTTP {uc.get('status')}: {uc.get('url')}")
+        elif any_error:
+            add(INFO, "could not verify (DBLP/arXiv rate-limited or unreachable) — "
+                      "re-run to confirm; NOT treated as a problem")
         else:
-            add(WARN, "no identifier, no DBLP match, and no URL to verify")
+            add(WARN, "not found in DBLP/arXiv/Crossref and no identifier or URL to verify")
 
     # --- verdict: driven by hard checks, not by informational notes --------
     sevs = [s for s, _ in issues]
@@ -833,7 +1061,7 @@ def verify_entry(net, entry):
     return {"entry": entry, "verdict": verdict, "issues": issues,
             "evidence": evidence, "arxiv_id": arxiv_id, "doi": doi,
             "openreview_id": openreview_id, "reference": title_ref,
-            "author_diff": author_diff}
+            "author_diff": author_diff, "any_error": any_error}
 
 
 def _venue_check(entry, recs):
@@ -1171,20 +1399,62 @@ def main():
     net = Net(delay=args.delay, use_cache=not args.no_cache, verbose=args.verbose)
     print(C.bold(f"Checking {len(entries)} citation(s) from {args.bibfile}\n"))
 
+    # Pre-fetch all arXiv ids in batches (1 request per ~40 ids) — far fewer
+    # requests than one-by-one, which both speeds things up and avoids the
+    # rate limiting that would otherwise stall a large bib.
+    arxiv_ids = []
+    for e in entries:
+        aid = extract_arxiv_id(e)
+        if aid:
+            arxiv_ids.append(aid)
+    arxiv_ids = sorted(set(arxiv_ids))
+    if arxiv_ids:
+        print(C.dim(f"  pre-fetching {len(arxiv_ids)} arXiv ids in batches…"))
+        net.arxiv_prefetch = arxiv_batch(net, arxiv_ids)
+        net.save()
+
+    def run_one(e):
+        try:
+            return verify_entry(net, e)
+        except Exception as ex:
+            return {"entry": e, "verdict": WARN,
+                    "issues": [(WARN, f"checker error: {ex}")],
+                    "evidence": [], "arxiv_id": None, "doi": None,
+                    "openreview_id": None, "reference": None, "any_error": True}
+
     results = []
     for idx, e in enumerate(entries, 1):
         sys.stdout.write(C.dim(f"[{idx}/{len(entries)}] {e['key']} …\r"))
         sys.stdout.flush()
-        try:
-            res = verify_entry(net, e)
-        except Exception as ex:
-            res = {"entry": e, "verdict": WARN,
-                   "issues": [(WARN, f"checker error: {ex}")],
-                   "evidence": [], "arxiv_id": None, "doi": None, "reference": None}
+        res = run_one(e)
         results.append(res)
         sys.stdout.write(" " * 60 + "\r")
         print(fmt_console(res))
         net.save()
+
+    # --- retry pass(es): re-verify entries that were limited by transient
+    # errors (rate limit / network). Successful lookups are cached, so a retry
+    # only re-fires the calls that previously failed. This directly avoids
+    # mislabelling real papers as unverifiable just because a source was busy.
+    for attempt in range(2):
+        pending = [i for i, r in enumerate(results)
+                   if r.get("any_error") and r["verdict"] != OK]
+        if not pending:
+            break
+        print(C.dim(f"\n  retry pass {attempt + 1}: re-verifying "
+                    f"{len(pending)} entr{'y' if len(pending) == 1 else 'ies'} "
+                    f"that hit rate limits…"))
+        time.sleep(3.0)
+        changed = False
+        for i in pending:
+            res = run_one(results[i]["entry"])
+            if res["verdict"] != results[i]["verdict"] or not res.get("any_error"):
+                changed = True
+            results[i] = res
+            print("  " + fmt_console(res).splitlines()[0])
+            net.save()
+        if not changed:
+            break
 
     # summary
     counts = {}
